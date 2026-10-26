@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_TOP_K_MASK,
 
         GGML_OP_UNARY,
 
@@ -925,6 +926,7 @@ extern "C" {
             enum   ggml_type      type);
 
     // dst[i0, i1, i2] = a[i0, i1, i2] + b[i0, ids[i1, i2]]
+    // an id of -1 adds nothing: dst[i0, i1, i2] = a[i0, i1, i2]
     GGML_API struct ggml_tensor * ggml_add_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1476,6 +1478,16 @@ extern "C" {
             enum ggml_prec       prec,
             int                  idx);
 
+    // [TAG_GGML_PREC]
+    // get the accumulator / src[idx] precision set by the functions above
+    // return GGML_PREC_UNDEFINED when the op does not carry the requested precision
+    GGML_API enum ggml_prec ggml_prec_get_acc(
+            const struct ggml_tensor * a);
+
+    GGML_API enum ggml_prec ggml_prec_get_src(
+            const struct ggml_tensor * a,
+            int                        idx);
+
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
@@ -1497,6 +1509,12 @@ extern "C" {
             enum ggml_op_hint    hint);
 
     // indirect matrix multiplication
+    // an id of -1 skips the slot and zeroes the matching row of the result
+    //
+    // [TAG_MUL_MAT_ID_DUPLICATE_ID]
+    // note: this op has undefined behaviour if a given `a` is referenced more than once for a given `b`
+    //       (i.e. duplicate experts per token are not guaranteed to be supported in all backends)
+    // TODO: add backend support: https://github.com/ggml-org/llama.cpp/pull/29998#issuecomment-6153742533
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
@@ -2649,6 +2667,7 @@ extern "C" {
     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2703,11 +2722,21 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * weights);
 
+    // hc_pre with a per-element gate (Qwen3.8-Flash-Next): gate [n_embd, hc, n_tokens]
+    //   result[i, t] = scale*sum_h x[i, h, t]*sigmoid(gate[i, h, t])
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_gated(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate,
+            float                 scale);
+
     // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
     //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
     //          -> [n_embd, hc, n_tokens]
     //   result[i, dst, t] = x[i, t]*post[dst, t]
     //                       + sum_src residual[i, src, t]*comb[dst, src, t]
+    //   comb == NULL uses the identity: result[i, dst, t] = x[i, t]*post[dst, t] + residual[i, dst, t]
     //
     GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,
@@ -2715,6 +2744,26 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
+    //
+    // mask:   [n_kv,    m1,  m2,  m3]  f16 or f32, broadcast to the rows of top_k
+    // top_k:  [n_top,   ne1, ne2, ne3] i32, picks of each row
+    // score:  [n_pick,  ne1, ne2, ne3] f32, can be NULL: a pick is live when its score is above -inf, else every pick is live
+    // blocks: [n_blk,   n_pick]        i32, can be NULL: the member cells of each pick, else a pick is a cell
+    // extra:  [n_extra, ne1, ne2, ne3] i32, can be NULL: cells of each row kept without a pick
+    // res:    [n_kv,    ne1, ne2, ne3] same type as mask
+    //
+    // res[c, i] = mask[c, i % m] when c is a cell of a live pick of row i or an extra cell of row i, else -inf
+    // picks and cells out of range are skipped
+    //
+    GGML_API struct ggml_tensor * ggml_top_k_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * extra);
 
     // custom operators
 
