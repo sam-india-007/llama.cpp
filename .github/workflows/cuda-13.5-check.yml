@@ -1,0 +1,262 @@
+name: CUDA 13.5 check
+
+# throwaway: runs only the CUDA 13.5 ubuntu-cuda and windows-cuda jobs copied from release.yml
+# do not merge
+
+on:
+  workflow_dispatch:
+  # dispatch needs the file on the default branch, so also run on push to this branch
+  push:
+    branches:
+      - nisha/upgrade-cuda-13.5-ci
+
+cache-mode: write
+permissions:
+  actions: write
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DLLAMA_CONNECT=ON"
+
+jobs:
+  # stand-in for release.yml check-release: fixed tag name, no tag push
+  check-release:
+    runs-on: ubuntu-slim
+
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      tag_name: ${{ steps.check.outputs.tag_name }}
+
+    steps:
+      - id: check
+        run: |
+          echo "should_release=true" >> $GITHUB_OUTPUT
+          echo "tag_name=cuda-check-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+  ui-build:
+    needs: [check-release]
+    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+    uses: ./.github/workflows/ui-build.yml
+
+  ubuntu-cuda:
+    name: ubuntu-cuda (${{ matrix.label }}, ${{ matrix.build }})
+    needs: [check-release, ui-build]
+    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+
+    strategy:
+      matrix:
+        include:
+          # label = short version used in artifact names / release body
+          # cuda  = full container image tag
+          # CTK >= 13.5 bundles CCCL >= 3.5; omit GGML_CUDA_CCCL_VERSION for those versions.
+          - build: 'x64'
+            os: ubuntu-24.04
+            cuda: '13.5.0'
+            label: '13.5'
+            defines: ''
+          - build: 'arm64'
+            os: ubuntu-24.04-arm
+            cuda: '13.5.0'
+            label: '13.5'
+            defines: ''
+
+    runs-on: ${{ matrix.os }}
+    container: nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu24.04
+
+    steps:
+      # the container has no git; install it before checkout so that a real git repository is created
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git
+
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # checkout runs as the host user; in-container steps run as root, so git
+      # refuses to touch a repo it does not own. Mark the workspace as safe.
+      # use the env var: the github.workspace context holds the HOST path,
+      # GITHUB_WORKSPACE the container path
+      - name: Git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Download UI build
+        uses: actions/download-artifact@v8
+        with:
+          name: llama-ui.zip
+          path: tools/ui/dist
+
+      - name: Dependencies
+        id: depends
+        # container jobs default to sh (dash); need bash for the [[ ]] below
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential cmake ninja-build libssl-dev jq python3-venv
+          # the container ships GCC 13, which does not know the 'sme' march
+          # feature used by the armv9.2 CPU variant of GGML_CPU_ALL_VARIANTS
+          if [[ "${{ matrix.build }}" == "arm64" ]]; then
+            apt-get install -y --no-install-recommends gcc-14 g++-14
+            echo "CC=gcc-14" >> "$GITHUB_ENV"
+            echo "CXX=g++-14" >> "$GITHUB_ENV"
+          fi
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: release-ubuntu-${{ matrix.os }}-cuda-${{ matrix.label }}-${{ matrix.build }}
+          evict-old-files: 1d
+          max-size: "1G"
+
+      - name: Build
+        id: cmake_build
+        # no CMAKE_CUDA_ARCHITECTURES: use the broad default arch set from
+        # ggml/src/ggml-cuda/CMakeLists.txt so the release binary covers many GPUs
+        run: |
+          cmake -B build \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_NCCL=OFF \
+            ${{ env.CMAKE_ARGS }} ${{ matrix.defines }}
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-${{ needs.check-release.outputs.tag_name }}-bin-ubuntu-cuda-${{ matrix.label }}-${{ matrix.build }}.tar.gz --transform "s,^\.,llama-${{ needs.check-release.outputs.tag_name }}," -C ./build/bin .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          path: llama-${{ needs.check-release.outputs.tag_name }}-bin-ubuntu-cuda-${{ matrix.label }}-${{ matrix.build }}.tar.gz
+          archive: false
+
+      # ship the CUDA runtime libraries the backend links against, mirroring
+      # the windows-cuda cudart zip - extract next to the binaries ($ORIGIN rpath)
+      - name: Pack CUDA runtime
+        id: pack_cuda_runtime
+        run: |
+          major="${{ matrix.label }}"
+          major="${major%%.*}"
+          mkdir -p ./cudart
+          # cp -L dereferences the SONAME symlinks into plain files, so the
+          # tarball holds exactly 3 files with no versioned duplicates
+          cp -L /usr/local/cuda/lib64/libcudart.so.${major} ./cudart/
+          cp -L /usr/local/cuda/lib64/libcublas.so.${major} ./cudart/
+          cp -L /usr/local/cuda/lib64/libcublasLt.so.${major} ./cudart/
+          tar -czvf cudart-llama-${{ needs.check-release.outputs.tag_name }}-bin-ubuntu-cuda-${{ matrix.label }}-${{ matrix.build }}.tar.gz --transform "s,^\.,cudart-llama-${{ needs.check-release.outputs.tag_name }}-bin-ubuntu-cuda-${{ matrix.label }}-${{ matrix.build }}," -C ./cudart .
+
+      - name: Upload CUDA runtime
+        uses: actions/upload-artifact@v7
+        with:
+          path: cudart-llama-${{ needs.check-release.outputs.tag_name }}-bin-ubuntu-cuda-${{ matrix.label }}-${{ matrix.build }}.tar.gz
+          archive: false
+
+      - name: ccache-clear
+        uses: ./.github/actions/ccache-clear
+        with:
+          key: release-ubuntu-${{ matrix.os }}-cuda-${{ matrix.label }}-${{ matrix.build }}
+
+  windows-cuda:
+    name: windows-cuda (${{ matrix.cuda }}, ${{ matrix.arch }})
+    needs: [check-release]
+    if: ${{ needs.check-release.outputs.should_release == 'true' }}
+
+    runs-on: windows-2022
+
+    strategy:
+      matrix:
+        include:
+          # CTK >= 13.5 bundles CCCL >= 3.5; omit GGML_CUDA_CCCL_VERSION for those versions.
+          - cuda: '13.5'
+            arch: x64
+            defines: ''
+          - cuda: '13.5'
+            arch: arm64
+            defines: '-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake'
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+          cuda_arch: ${{ matrix.arch }}
+
+      - name: Install Ninja
+        id: install_ninja
+        run: |
+          choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: release-windows-2022-${{ matrix.arch }}-cuda-${{ matrix.cuda }}
+          evict-old-files: 1d
+
+      - name: Build
+        id: cmake_build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.arch == 'x64' && 'x64' || 'amd64_arm64' }}
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ${{ matrix.defines }}
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip .\build\bin\Release\ggml-cuda.dll
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          path: llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip
+          archive: false
+
+      - name: Copy and pack Cuda runtime (x64)
+        if: ${{ matrix.arch == 'x64' }}
+        run: |
+          echo "Cuda install location: ${{ env.CUDA_PATH }}"
+          $dst='.\build\bin\cudart\'
+          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip $dst\*
+
+      - name: Copy and pack Cuda runtime (ARM64)
+        if: ${{ matrix.arch == 'arm64' }}
+        run: |
+          echo "Cuda install location: ${{ env.CUDA_PATH }}"
+          $dst='.\build\bin\cudart\'
+          robocopy "${{env.CUDA_PATH}}\bin\arm64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip $dst\*
+
+      - name: Upload Cuda runtime
+        uses: actions/upload-artifact@v7
+        with:
+          path: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-${{ matrix.arch }}.zip
+          archive: false
+
+      - name: ccache-clear
+        uses: ./.github/actions/ccache-clear
+        with:
+          key: release-windows-2022-${{ matrix.arch }}-cuda-${{ matrix.cuda }}
